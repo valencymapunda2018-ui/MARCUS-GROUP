@@ -1,0 +1,2843 @@
+ * @module
+ */
+
+import type * as businesses from "../businesses.js";
+import type * as employees from "../employees.js";
+import type * as hercules from "../hercules.js";
+import type * as lib_access from "../lib/access.js";
+import type * as lib_constants from "../lib/constants.js";
+import type * as lib_rules from "../lib/rules.js";
+import type * as lib_validators from "../lib/validators.js";
+import type * as users from "../users.js";
+
+import type {
+} from "convex/server";
+
+declare const fullApi: ApiFromModules<{
+  businesses: typeof businesses;
+  employees: typeof employees;
+  hercules: typeof hercules;
+  "lib/access": typeof lib_access;
+  "lib/constants": typeof lib_constants;
+  "lib/rules": typeof lib_rules;
+  "lib/validators": typeof lib_validators;
+  users: typeof users;
+}>;
+
+
+convex/businesses.test.ts
+98
+import { convexTest } from "convex-test";
+import { describe, expect, it } from "vitest";
+import { api } from "./_generated/api";
+import schema from "./schema";
+import { modules } from "./test.setup";
+
+const BUSINESS = {
+  name: "Marcus Hardware",
+  category: "Retail",
+  location: "Dar es Salaam",
+  currency: "TZS",
+  startingCapital: 500_000_000,
+  currentCapital: 750_000_000,
+};
+
+async function setup() {
+  const t = convexTest(schema, modules);
+  const owner = t.withIdentity({ tokenIdentifier: "owner", name: "Marcus" });
+  const staff = t.withIdentity({ tokenIdentifier: "staff", name: "Amina" });
+  await owner.mutation(api.users.updateCurrentUser, {});
+  await staff.mutation(api.users.updateCurrentUser, {});
+  return { t, owner, staff };
+}
+
+describe("business access", () => {
+  it("makes the first user Super Administrator and later users staff", async () => {
+    const { owner, staff } = await setup();
+    expect((await owner.query(api.users.getCurrentUser, {}))?.role).toBe("super_admin");
+    expect((await staff.query(api.users.getCurrentUser, {}))?.role).toBe("staff");
+  });
+
+  it("lets only the Super Administrator register businesses", async () => {
+    const { owner, staff } = await setup();
+    await expect(staff.mutation(api.businesses.create, BUSINESS)).rejects.toThrow(
+      /Super Administrator/,
+    );
+    const id = await owner.mutation(api.businesses.create, BUSINESS);
+    expect(await owner.query(api.businesses.get, { id })).toMatchObject({
+      name: "Marcus Hardware",
+      canManage: true,
+    });
+  });
+
+  it("hides businesses from users who are not assigned", async () => {
+    const { owner, staff } = await setup();
+    const id = await owner.mutation(api.businesses.create, BUSINESS);
+    expect(await staff.query(api.businesses.list, {})).toEqual([]);
+    expect(await staff.query(api.businesses.get, { id })).toBeNull();
+    await expect(
+      staff.mutation(api.businesses.update, { id, ...BUSINESS, name: "Hacked" }),
+    ).rejects.toThrow();
+    await expect(
+      staff.mutation(api.employees.create, {
+        businessId: id,
+        name: "X",
+        position: "Y",
+        monthlySalary: 0,
+        status: "active",
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("lets assigned staff read but not edit", async () => {
+    const { t, owner, staff } = await setup();
+    const id = await owner.mutation(api.businesses.create, BUSINESS);
+    await t.run(async (ctx) => {
+      const user = await ctx.db
+        .query("users")
+        .withIndex("by_token", (q) => q.eq("tokenIdentifier", "staff"))
+        .unique();
+      if (!user) throw new Error("missing user");
+      await ctx.db.insert("businessMembers", { businessId: id, userId: user._id, role: "staff" });
+    });
+    expect(await staff.query(api.businesses.list, {})).toHaveLength(1);
+    expect(await staff.query(api.businesses.get, { id })).toMatchObject({ canManage: false });
+    await expect(
+      staff.mutation(api.businesses.update, { id, ...BUSINESS }),
+    ).rejects.toThrow(/permission/);
+  });
+
+  it("rejects negative or fractional money and blank names", async () => {
+    const { owner } = await setup();
+    await expect(
+      owner.mutation(api.businesses.create, { ...BUSINESS, startingCapital: -1 }),
+    ).rejects.toThrow(/Starting capital/);
+    await expect(
+      owner.mutation(api.businesses.create, { ...BUSINESS, currentCapital: 1.5 }),
+    ).rejects.toThrow(/Current capital/);
+    await expect(
+      owner.mutation(api.businesses.create, { ...BUSINESS, name: "   " }),
+    ).rejects.toThrow(/name is required/);
+  });
+
+  it("returns null for a malformed business id", async () => {
+    const { owner } = await setup();
+    expect(await owner.query(api.businesses.get, { id: "not-an-id" })).toBeNull();
+  });
+});
+
+convex/businesses.ts
+168
+import { ConvexError, v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+import type { QueryCtx } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
+import {
+  getCurrentUserDoc,
+  isSuperAdmin,
+  requireBusinessAccess,
+  requireSuperAdmin,
+  requireUser,
+} from "./lib/access";
+import {
+  optionalCalendarDay,
+  optionalText,
+  requireCurrency,
+  requireMoney,
+  requireText,
+} from "./lib/rules";
+import { businessStatusValidator } from "./lib/validators";
+
+const MAX_BUSINESSES = 500;
+
+const businessFields = {
+  name: v.string(),
+  category: v.string(),
+  location: v.string(),
+  registrationNumber: v.optional(v.string()),
+  taxId: v.optional(v.string()),
+  registrationDate: v.optional(v.string()),
+  description: v.optional(v.string()),
+  currency: v.string(),
+  startingCapital: v.number(),
+  currentCapital: v.number(),
+};
+
+type BusinessInput = {
+  name: string;
+  category: string;
+  location: string;
+  registrationNumber?: string;
+  taxId?: string;
+  registrationDate?: string;
+  description?: string;
+  currency: string;
+  startingCapital: number;
+  currentCapital: number;
+};
+
+function cleanBusiness(args: BusinessInput) {
+  return {
+    name: requireText(args.name, "Business name", 120),
+    category: requireText(args.category, "Category", 60),
+    location: requireText(args.location, "Location", 160),
+    registrationNumber: optionalText(
+      args.registrationNumber,
+      "Registration number",
+      80,
+    ),
+    taxId: optionalText(args.taxId, "TIN", 80),
+    registrationDate: optionalCalendarDay(
+      args.registrationDate,
+      "Registration date",
+    ),
+    description: optionalText(args.description, "Description", 2000),
+    currency: requireCurrency(args.currency),
+    startingCapital: requireMoney(args.startingCapital, "Starting capital"),
+    currentCapital: requireMoney(args.currentCapital, "Current capital"),
+  };
+}
+
+async function listVisibleBusinesses(
+  ctx: QueryCtx,
+  user: Doc<"users">,
+  status: Doc<"businesses">["status"],
+): Promise<Doc<"businesses">[]> {
+  if (isSuperAdmin(user)) {
+    return await ctx.db
+      .query("businesses")
+      .withIndex("by_status", (q) => q.eq("status", status))
+      .order("desc")
+      .take(MAX_BUSINESSES);
+  }
+  const memberships = await ctx.db
+    .query("businessMembers")
+    .withIndex("by_user_and_business", (q) => q.eq("userId", user._id))
+    .take(MAX_BUSINESSES);
+  const businesses = await Promise.all(
+    memberships.map((m) => ctx.db.get("businesses", m.businessId)),
+  );
+  return businesses.filter(
+    (b): b is Doc<"businesses"> => b !== null && b.status === status,
+  );
+}
+
+export const list = query({
+  args: { status: v.optional(businessStatusValidator) },
+  handler: async (ctx, args) => {
+    const user = await getCurrentUserDoc(ctx);
+    if (!user) return [];
+    return await listVisibleBusinesses(ctx, user, args.status ?? "active");
+  },
+});
+
+export const get = query({
+  args: { id: v.string() },
+  handler: async (ctx, args) => {
+    const user = await getCurrentUserDoc(ctx);
+    if (!user) return null;
+    const id = ctx.db.normalizeId("businesses", args.id);
+    if (!id) return null;
+    const business = await ctx.db.get("businesses", id);
+    if (!business) return null;
+    try {
+      await requireBusinessAccess(ctx, user, id, "read");
+    } catch {
+      return null;
+    }
+    const canManage = isSuperAdmin(user)
+      ? true
+      : (
+          await ctx.db
+            .query("businessMembers")
+            .withIndex("by_user_and_business", (q) =>
+              q.eq("userId", user._id).eq("businessId", id),
+            )
+            .unique()
+        )?.role === "business_manager";
+    return { ...business, canManage, canArchive: isSuperAdmin(user) };
+  },
+});
+
+export const create = mutation({
+  args: businessFields,
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx);
+    requireSuperAdmin(user);
+    return await ctx.db.insert("businesses", {
+      ...cleanBusiness(args),
+      status: "active",
+      createdBy: user._id,
+    });
+  },
+});
+
+export const update = mutation({
+  args: { id: v.id("businesses"), ...businessFields },
+  handler: async (ctx, { id, ...rest }) => {
+    const user = await requireUser(ctx);
+    await requireBusinessAccess(ctx, user, id, "manage");
+    await ctx.db.patch("businesses", id, cleanBusiness(rest));
+    return null;
+  },
+});
+
+export const setStatus = mutation({
+  args: { id: v.id("businesses"), status: businessStatusValidator },
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx);
+    requireSuperAdmin(user);
+    const business = await ctx.db.get("businesses", args.id);
+    if (!business) {
+      throw new ConvexError({ code: "NOT_FOUND", message: "Business not found" });
+    }
+    // Archiving (soft delete) keeps the full financial history intact.
+    await ctx.db.patch("businesses", args.id, { status: args.status });
+    return null;
+  },
+});
+
+convex/employees.ts
+104
+import { v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+import { ConvexError } from "convex/values";
+import {
+  getCurrentUserDoc,
+  canAccessBusiness,
+  requireBusinessAccess,
+  requireUser,
+} from "./lib/access";
+import {
+  optionalCalendarDay,
+  optionalEmail,
+  optionalText,
+  requireMoney,
+  requireText,
+} from "./lib/rules";
+import { employeeStatusValidator } from "./lib/validators";
+
+const employeeFields = {
+  name: v.string(),
+  position: v.string(),
+  phone: v.optional(v.string()),
+  email: v.optional(v.string()),
+  monthlySalary: v.number(),
+  startDate: v.optional(v.string()),
+  status: employeeStatusValidator,
+};
+
+type EmployeeInput = {
+  name: string;
+  position: string;
+  phone?: string;
+  email?: string;
+  monthlySalary: number;
+  startDate?: string;
+  status: "active" | "inactive";
+};
+
+function cleanEmployee(args: EmployeeInput) {
+  return {
+    name: requireText(args.name, "Name", 120),
+    position: requireText(args.position, "Position", 80),
+    phone: optionalText(args.phone, "Phone", 40),
+    email: optionalEmail(args.email),
+    monthlySalary: requireMoney(args.monthlySalary, "Monthly salary"),
+    startDate: optionalCalendarDay(args.startDate, "Start date"),
+    status: args.status,
+  };
+}
+
+export const listByBusiness = query({
+  args: { businessId: v.id("businesses") },
+  handler: async (ctx, args) => {
+    const user = await getCurrentUserDoc(ctx);
+    if (!user) return [];
+    if (!(await canAccessBusiness(ctx, user, args.businessId, "read"))) {
+      return [];
+    }
+    return await ctx.db
+      .query("employees")
+      .withIndex("by_business", (q) => q.eq("businessId", args.businessId))
+      .take(500);
+  },
+});
+
+export const create = mutation({
+  args: { businessId: v.id("businesses"), ...employeeFields },
+  handler: async (ctx, { businessId, ...rest }) => {
+    const user = await requireUser(ctx);
+    await requireBusinessAccess(ctx, user, businessId, "manage");
+    return await ctx.db.insert("employees", {
+      businessId,
+      ...cleanEmployee(rest),
+    });
+  },
+});
+
+export const update = mutation({
+  args: { id: v.id("employees"), ...employeeFields },
+  handler: async (ctx, { id, ...rest }) => {
+    const user = await requireUser(ctx);
+    const employee = await ctx.db.get("employees", id);
+    if (!employee) {
+      throw new ConvexError({ code: "NOT_FOUND", message: "Employee not found" });
+    }
+    await requireBusinessAccess(ctx, user, employee.businessId, "manage");
+    await ctx.db.patch("employees", id, cleanEmployee(rest));
+    return null;
+  },
+});
+
+export const remove = mutation({
+  args: { id: v.id("employees") },
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx);
+    const employee = await ctx.db.get("employees", args.id);
+    if (!employee) {
+      throw new ConvexError({ code: "NOT_FOUND", message: "Employee not found" });
+    }
+    await requireBusinessAccess(ctx, user, employee.businessId, "manage");
+    await ctx.db.delete("employees", args.id);
+    return null;
+  },
+});
+
+convex/lib/access.ts
+83
+import { ConvexError } from "convex/values";
+import type { QueryCtx } from "../_generated/server";
+import type { Doc, Id } from "../_generated/dataModel";
+
+export type AccessLevel = "read" | "manage";
+
+export async function getCurrentUserDoc(
+  ctx: QueryCtx,
+): Promise<Doc<"users"> | null> {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) return null;
+  return await ctx.db
+    .query("users")
+    .withIndex("by_token", (q) =>
+      q.eq("tokenIdentifier", identity.tokenIdentifier),
+    )
+    .unique();
+}
+
+export async function requireUser(ctx: QueryCtx): Promise<Doc<"users">> {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) {
+    throw new ConvexError({
+      code: "UNAUTHENTICATED",
+      message: "Please sign in to continue",
+    });
+  }
+  const user = await getCurrentUserDoc(ctx);
+  if (!user) {
+    throw new ConvexError({ code: "NOT_FOUND", message: "User not found" });
+  }
+  return user;
+}
+
+export function isSuperAdmin(user: Doc<"users">): boolean {
+  return user.role === "super_admin";
+}
+
+export function requireSuperAdmin(user: Doc<"users">): void {
+  if (!isSuperAdmin(user)) {
+    throw new ConvexError({
+      code: "FORBIDDEN",
+      message: "Only the Super Administrator can do this",
+    });
+  }
+}
+
+/** Returns true if the user may read (or manage) the given business. */
+export async function canAccessBusiness(
+  ctx: QueryCtx,
+  user: Doc<"users">,
+  businessId: Id<"businesses">,
+  level: AccessLevel,
+): Promise<boolean> {
+  if (isSuperAdmin(user)) return true;
+  const membership = await ctx.db
+    .query("businessMembers")
+    .withIndex("by_user_and_business", (q) =>
+      q.eq("userId", user._id).eq("businessId", businessId),
+    )
+    .unique();
+  if (!membership) return false;
+  return level === "read" || membership.role === "business_manager";
+}
+
+export async function requireBusinessAccess(
+  ctx: QueryCtx,
+  user: Doc<"users">,
+  businessId: Id<"businesses">,
+  level: AccessLevel,
+): Promise<Doc<"businesses">> {
+  const business = await ctx.db.get("businesses", businessId);
+  if (!business) {
+    throw new ConvexError({ code: "NOT_FOUND", message: "Business not found" });
+  }
+  if (!(await canAccessBusiness(ctx, user, businessId, level))) {
+    throw new ConvexError({
+      code: "FORBIDDEN",
+      message: "You do not have permission for this business",
+    });
+  }
+  return business;
+}
+
+convex/lib/constants.ts
+40
+// Shared between the backend and the frontend.
+
+export const DEFAULT_CURRENCY = "TZS";
+
+export const CURRENCIES = [
+  { code: "TZS", label: "Tanzanian Shilling" },
+  { code: "USD", label: "US Dollar" },
+  { code: "KES", label: "Kenyan Shilling" },
+  { code: "UGX", label: "Ugandan Shilling" },
+  { code: "RWF", label: "Rwandan Franc" },
+  { code: "EUR", label: "Euro" },
+  { code: "GBP", label: "British Pound" },
+] as const;
+
+export const CURRENCY_CODES: readonly string[] = CURRENCIES.map((c) => c.code);
+
+export const BUSINESS_CATEGORIES = [
+  "Retail",
+  "Wholesale",
+  "Real Estate",
+  "Agriculture",
+  "Transport & Logistics",
+  "Hospitality",
+  "Manufacturing",
+  "Construction",
+  "Financial Services",
+  "Technology",
+  "Health",
+  "Education",
+  "Other",
+] as const;
+
+export const ROLE_LABELS = {
+  super_admin: "Super Administrator",
+  business_manager: "Business Manager",
+  accountant: "Accountant",
+  staff: "Staff",
+} as const;
+
+export type UserRole = keyof typeof ROLE_LABELS;
+
+convex/lib/rules.ts
+64
+import { ConvexError } from "convex/values";
+import { CURRENCY_CODES } from "./constants";
+
+const badRequest = (message: string) =>
+  new ConvexError({ code: "BAD_REQUEST", message });
+
+export function requireText(value: string, field: string, max = 200): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw badRequest(`${field} is required`);
+  if (trimmed.length > max) {
+    throw badRequest(`${field} must be ${max} characters or fewer`);
+  }
+  return trimmed;
+}
+
+export function optionalText(
+  value: string | undefined,
+  field: string,
+  max = 2000,
+): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > max) {
+    throw badRequest(`${field} must be ${max} characters or fewer`);
+  }
+  return trimmed;
+}
+
+/** Money must be a non-negative integer count of minor units. */
+export function requireMoney(value: number, field: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw badRequest(`${field} must be zero or a positive amount`);
+  }
+  return value;
+}
+
+export function requireCurrency(code: string): string {
+  if (!CURRENCY_CODES.includes(code)) {
+    throw badRequest("Unsupported currency");
+  }
+  return code;
+}
+
+const CALENDAR_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+export function optionalCalendarDay(
+  value: string | undefined,
+  field: string,
+): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (!CALENDAR_DAY.test(value) || Number.isNaN(Date.parse(value))) {
+    throw badRequest(`${field} must be a valid date`);
+  }
+  return value;
+}
+
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function optionalEmail(value: string | undefined): string | undefined {
+  const trimmed = optionalText(value, "Email", 200);
+  if (trimmed && !EMAIL.test(trimmed)) throw badRequest("Email is not valid");
+  return trimmed;
+}
+
+convex/lib/validators.ts
+24
+import { v } from "convex/values";
+
+export const userRoleValidator = v.union(
+  v.literal("super_admin"),
+  v.literal("business_manager"),
+  v.literal("accountant"),
+  v.literal("staff"),
+);
+
+export const memberRoleValidator = v.union(
+  v.literal("business_manager"),
+  v.literal("accountant"),
+  v.literal("staff"),
+);
+
+export const businessStatusValidator = v.union(
+  v.literal("active"),
+  v.literal("archived"),
+);
+
+export const employeeStatusValidator = v.union(
+  v.literal("active"),
+  v.literal("inactive"),
+);
+
+convex/schema.ts
+50
+1
+import { defineSchema, defineTable } from "convex/server";
+import { v } from "convex/values";
+import {
+  businessStatusValidator,
+  employeeStatusValidator,
+  memberRoleValidator,
+  userRoleValidator,
+} from "./lib/validators";
+
+export default defineSchema({
+  users: defineTable({
+    tokenIdentifier: v.string(),
+    name: v.optional(v.string()),
+    email: v.optional(v.string()),
+  }).index("by_token", ["tokenIdentifier"]),
+    // Global role. Only super_admin sees every business; others see assigned ones.
+    role: v.optional(userRoleValidator),
+  })
+    .index("by_token", ["tokenIdentifier"])
+    .index("by_role", ["role"]),
+
+  businesses: defineTable({
+    name: v.string(),
+    category: v.string(),
+    location: v.string(),
+    registrationNumber: v.optional(v.string()),
+    taxId: v.optional(v.string()),
+    // Calendar day, YYYY-MM-DD
+    registrationDate: v.optional(v.string()),
+    description: v.optional(v.string()),
+    currency: v.string(),
+    // Money is stored in minor units (cents) as integers
+    startingCapital: v.number(),
+    currentCapital: v.number(),
+    status: businessStatusValidator,
+    createdBy: v.id("users"),
+  }).index("by_status", ["status"]),
+
+  // Which users may access which business, and with what role
+  businessMembers: defineTable({
+    businessId: v.id("businesses"),
+    userId: v.id("users"),
+    role: memberRoleValidator,
+  })
+    .index("by_business", ["businessId"])
+    .index("by_user_and_business", ["userId", "businessId"]),
+
+  employees: defineTable({
+    businessId: v.id("businesses"),
+    name: v.string(),
+    position: v.string(),
+    phone: v.optional(v.string()),
+    email: v.optional(v.string()),
+    // Monthly salary in minor units, in the business currency
+    monthlySalary: v.number(),
+    // Calendar day, YYYY-MM-DD
+    startDate: v.optional(v.string()),
+    status: employeeStatusValidator,
+  }).index("by_business", ["businessId"]),
+});
+
+convex/users.ts
+13
+2
+      });
+    }
+
+    // Check if we've already stored this identity before.
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_token", (q) =>
+        q.eq("tokenIdentifier", identity.tokenIdentifier),
+      )
+      .unique();
+
+    // The very first person to sign in becomes the Super Administrator (the owner).
+    const existingAdmin = await ctx.db
+      .query("users")
+      .withIndex("by_role", (q) => q.eq("role", "super_admin"))
+      .first();
+
+    if (user !== null) {
+      if (!user.role) {
+        await ctx.db.patch("users", user._id, {
+          role: existingAdmin ? "staff" : "super_admin",
+        });
+      }
+      return user._id;
+    }
+    // If it's a new identity, create a new User.
+    return await ctx.db.insert("users", {
+      name: identity.name,
+      email: identity.email,
+      tokenIdentifier: identity.tokenIdentifier,
+      role: existingAdmin ? "staff" : "super_admin",
+    });
+  },
+});
+
+index.html
+3
+3
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>Hercules App</title>
+    <meta name="description" content="An app made by https://hercules.app" />
+    <title>Marcus Business Group</title>
+    <meta name="description" content="Manage every business, property, farm, credit and investment of Marcus Business Group from one place." />
+    <link rel="icon" href="/favicon.ico" />
+
+    <!-- Fonts: Hercules serves Google Fonts from the app's own origin. The path
+         takes the same query as https://fonts.googleapis.com/css2. -->
+    <link
+      href="/_hercules/font/css2?family=Fira+Code:wght@300..700&family=Geist+Mono:wght@100..900&family=Geist:wght@100..900&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Montserrat:ital,wght@0,100..900;1,100..900&family=Noto+Serif:ital,wght@0,100..900;1,100..900&display=swap"
+      href="/_hercules/font/css2?family=Plus+Jakarta+Sans:ital,wght@0,200..800;1,200..800&family=Fraunces:opsz,wght@9..144,400..800&family=Fira+Code:wght@300..700&family=Geist+Mono:wght@100..900&family=Geist:wght@100..900&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Montserrat:ital,wght@0,100..900;1,100..900&family=Noto+Serif:ital,wght@0,100..900;1,100..900&display=swap"
+      rel="stylesheet"
+    />
+
+
+src/App.tsx
+8
+1
+import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { DefaultProviders } from "./components/providers/default.tsx";
+import { RootErrorBoundary } from "./components/root-error-boundary.tsx";
+import AppLayout from "./components/layout/app-layout.tsx";
+import AuthCallback from "./pages/auth/Callback.tsx";
+import Index from "./pages/Index.tsx";
+import BusinessesPage from "./pages/businesses/page.tsx";
+import BusinessDetailPage from "./pages/businesses/[id]/page.tsx";
+import NotFound from "./pages/NotFound.tsx";
+
+export default function App() {
+      <RootErrorBoundary>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/" element={<Index />} />
+            <Route path="/auth/callback" element={<AuthCallback />} />
+            <Route element={<AppLayout />}>
+              <Route path="/" element={<Index />} />
+              <Route path="/businesses" element={<BusinessesPage />} />
+              <Route path="/businesses/:id" element={<BusinessDetailPage />} />
+            </Route>
+            {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+
+src/components/layout/app-layout.tsx
+60
+import { Outlet } from "react-router-dom";
+import { Authenticated, AuthLoading, Unauthenticated } from "convex/react";
+import {
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar.tsx";
+import { Separator } from "@/components/ui/separator.tsx";
+import { Skeleton } from "@/components/ui/skeleton.tsx";
+import { SignInButton } from "@/components/ui/signin.tsx";
+import AppSidebar from "./app-sidebar.tsx";
+import ThemeToggle from "./theme-toggle.tsx";
+import WelcomeScreen from "./welcome-screen.tsx";
+
+function AuthedShell() {
+  return (
+    <SidebarProvider>
+      <AppSidebar />
+      <SidebarInset className="min-w-0">
+        <header className="sticky top-0 z-20 flex h-14 items-center gap-2 border-b bg-card/90 px-4 backdrop-blur">
+          <SidebarTrigger className="-ml-1" />
+          <Separator orientation="vertical" className="mr-1 h-5" />
+          <p className="hidden truncate text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase sm:block">
+            Marcus Business Group
+          </p>
+          <div className="ml-auto flex items-center gap-1">
+            <ThemeToggle />
+            <SignInButton variant="ghost" size="sm" />
+          </div>
+        </header>
+        <main className="flex-1">
+          <Outlet />
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
+  );
+}
+
+export default function AppLayout() {
+  return (
+    <>
+      <AuthLoading>
+        <div className="flex min-h-screen">
+          <Skeleton className="hidden h-screen w-64 rounded-none md:block" />
+          <div className="flex-1 space-y-4 p-8">
+            <Skeleton className="h-10 w-64" />
+            <Skeleton className="h-32 w-full" />
+            <Skeleton className="h-64 w-full" />
+          </div>
+        </div>
+      </AuthLoading>
+      <Unauthenticated>
+        <WelcomeScreen />
+      </Unauthenticated>
+      <Authenticated>
+        <AuthedShell />
+      </Authenticated>
+    </>
+  );
+}
+
+src/components/layout/app-sidebar.tsx
+109
+import { Link, useLocation } from "react-router-dom";
+import { toast } from "sonner";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  useSidebar,
+} from "@/components/ui/sidebar.tsx";
+import { useCurrentUser } from "@/hooks/use-current-user.ts";
+import { ROLE_LABELS } from "@/convex/lib/constants.ts";
+import BrandMark from "./brand-mark.tsx";
+import { NAV_GROUPS, type NavItem } from "./nav-items.ts";
+
+function isActive(pathname: string, path: string): boolean {
+  return path === "/" ? pathname === "/" : pathname.startsWith(path);
+}
+
+function NavLink({ item }: { item: NavItem }) {
+  const { pathname } = useLocation();
+  const { setOpenMobile } = useSidebar();
+  const Icon = item.icon;
+
+  if (!item.path) {
+    return (
+      <SidebarMenuButton
+        className="cursor-pointer"
+        tooltip={item.title}
+        onClick={() => toast("Coming soon in a future milestone!")}
+      >
+        <Icon />
+        <span>{item.title}</span>
+      </SidebarMenuButton>
+    );
+  }
+
+  const active = isActive(pathname, item.path);
+  return (
+    <SidebarMenuButton
+      asChild
+      isActive={active}
+      tooltip={item.title}
+      className="cursor-pointer data-[active=true]:bg-sidebar-accent data-[active=true]:shadow-[inset_3px_0_0_var(--sidebar-primary)]"
+    >
+      <Link to={item.path} onClick={() => setOpenMobile(false)}>
+        <Icon />
+        <span>{item.title}</span>
+      </Link>
+    </SidebarMenuButton>
+  );
+}
+
+export default function AppSidebar() {
+  const { user } = useCurrentUser();
+
+  return (
+    <Sidebar collapsible="icon">
+      <SidebarHeader className="border-b border-sidebar-border px-3 py-4">
+        <Link to="/" className="flex items-center gap-3 cursor-pointer">
+          <BrandMark />
+          <div className="min-w-0 group-data-[collapsible=icon]:hidden">
+            <p className="truncate font-serif text-base leading-tight font-semibold tracking-tight text-white">
+              Marcus
+            </p>
+            <p className="truncate text-[10px] font-semibold tracking-[0.22em] text-sidebar-foreground/60 uppercase">
+              Business Group
+            </p>
+          </div>
+        </Link>
+      </SidebarHeader>
+
+      <SidebarContent className="py-2">
+        {NAV_GROUPS.map((group) => (
+          <SidebarGroup key={group.label}>
+            <SidebarGroupLabel className="text-[10px] tracking-[0.18em] text-sidebar-foreground/45 uppercase">
+              {group.label}
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {group.items.map((item) => (
+                  <SidebarMenuItem key={item.title}>
+                    <NavLink item={item} />
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
+      </SidebarContent>
+
+      <SidebarFooter className="border-t border-sidebar-border p-3 group-data-[collapsible=icon]:hidden">
+        <div className="rounded-md bg-sidebar-accent px-3 py-2">
+          <p className="truncate text-sm font-medium text-white">
+            {user?.name ?? user?.email ?? "Signed in"}
+          </p>
+          <p className="text-[11px] text-sidebar-foreground/60">
+            {user?.role ? ROLE_LABELS[user.role] : "—"}
+          </p>
+        </div>
+      </SidebarFooter>
+    </Sidebar>
+  );
+}
+
+src/components/layout/brand-mark.tsx
+10
+export default function BrandMark({ className }: { className?: string }) {
+  return (
+    <div className={className}>
+      <div className="relative flex size-9 shrink-0 items-center justify-center rounded-md bg-[#c8102e] font-serif text-lg font-bold text-white shadow-md">
+        M
+        <span className="absolute -right-1 -bottom-1 size-3 rounded-sm border-2 border-sidebar bg-white" />
+      </div>
+    </div>
+  );
+}
+
+src/components/layout/nav-items.ts
+49
+import {
+  BarChart3,
+  Building2,
+  HandCoins,
+  Home,
+  Landmark,
+  LayoutDashboard,
+  ShieldCheck,
+  Sprout,
+  Wallet,
+  type LucideIcon,
+} from "lucide-react";
+
+export type NavItem = {
+  title: string;
+  icon: LucideIcon;
+  // Routes without a path arrive in a later milestone.
+  path?: string;
+};
+
+export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
+  {
+    label: "Overview",
+    items: [
+      { title: "Dashboard", icon: LayoutDashboard, path: "/" },
+      { title: "Businesses", icon: Building2, path: "/businesses" },
+    ],
+  },
+  {
+    label: "Finance",
+    items: [
+      { title: "Income & Expenses", icon: Wallet },
+      { title: "Assets & Liabilities", icon: Landmark },
+      { title: "Reports", icon: BarChart3 },
+    ],
+  },
+  {
+    label: "Operations",
+    items: [
+      { title: "Rent Ledger", icon: Home },
+      { title: "Credit Records", icon: HandCoins },
+      { title: "Agriculture", icon: Sprout },
+    ],
+  },
+  {
+    label: "Administration",
+    items: [{ title: "Team & Security", icon: ShieldCheck }],
+  },
+];
+
+src/components/layout/theme-toggle.tsx
+18
+import { Moon, Sun } from "lucide-react";
+import { useTheme } from "next-themes";
+import { Button } from "@/components/ui/button.tsx";
+
+export default function ThemeToggle() {
+  const { resolvedTheme, setTheme } = useTheme();
+  const isDark = resolvedTheme === "dark";
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      aria-label="Toggle dark mode"
+      onClick={() => setTheme(isDark ? "light" : "dark")}
+    >
+      {isDark ? <Sun /> : <Moon />}
+    </Button>
+  );
+}
+
+src/components/layout/welcome-screen.tsx
+94
+import { motion } from "motion/react";
+import {
+  Building2,
+  HandCoins,
+  Home,
+  Landmark,
+  Sprout,
+  Wallet,
+} from "lucide-react";
+import { SignInButton } from "@/components/ui/signin.tsx";
+import BrandMark from "./brand-mark.tsx";
+
+const MODULES = [
+  { icon: Building2, label: "Businesses" },
+  { icon: Wallet, label: "Income & Expenses" },
+  { icon: Home, label: "Rent Ledger" },
+  { icon: HandCoins, label: "Credit Records" },
+  { icon: Sprout, label: "Agriculture" },
+  { icon: Landmark, label: "Assets & Liabilities" },
+];
+
+const fadeUp = (delay: number) => ({
+  initial: { opacity: 0, y: 16 },
+  animate: { opacity: 1, y: 0 },
+  transition: { duration: 0.6, delay, ease: "easeOut" as const },
+});
+
+export default function WelcomeScreen() {
+  return (
+    <div className="relative min-h-screen overflow-hidden bg-[#0d1838] text-white">
+      {/* Layered atmosphere: navy depth, a red glow and a fine ledger grid */}
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top_right,rgba(200,16,46,0.35),transparent_55%),radial-gradient(ellipse_at_bottom_left,rgba(56,96,200,0.35),transparent_60%)]" />
+      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.04)_1px,transparent_1px)] bg-[size:48px_48px]" />
+
+      <div className="relative mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-8">
+        <motion.header {...fadeUp(0)} className="flex items-center gap-3">
+          <BrandMark />
+          <div>
+            <p className="font-serif text-lg leading-tight font-semibold">
+              Marcus
+            </p>
+            <p className="text-[10px] font-semibold tracking-[0.22em] text-white/60 uppercase">
+              Business Group
+            </p>
+          </div>
+        </motion.header>
+
+        <div className="flex flex-1 flex-col justify-center py-16">
+          <motion.p
+            {...fadeUp(0.1)}
+            className="mb-5 text-xs font-semibold tracking-[0.3em] text-[#ff5a6e] uppercase"
+          >
+            Portfolio command centre
+          </motion.p>
+          <motion.h1
+            {...fadeUp(0.2)}
+            className="max-w-3xl font-serif text-5xl leading-[1.05] font-semibold text-balance md:text-7xl"
+          >
+            Every business. One clear picture.
+          </motion.h1>
+          <motion.p
+            {...fadeUp(0.3)}
+            className="mt-6 max-w-xl text-lg text-white/70"
+          >
+            Track revenue, rent, credit, farms and assets across the whole
+            group, in Tanzanian Shillings and any other currency you use.
+          </motion.p>
+          <motion.div {...fadeUp(0.4)} className="mt-10">
+            <SignInButton
+              size="lg"
+              variant="action"
+              signInText="Sign in to your workspace"
+            />
+          </motion.div>
+        </div>
+
+        <motion.div
+          {...fadeUp(0.55)}
+          className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-white/10 bg-white/10 md:grid-cols-6"
+        >
+          {MODULES.map(({ icon: Icon, label }) => (
+            <div
+              key={label}
+              className="flex items-center gap-3 bg-[#0d1838]/80 px-4 py-4 text-sm text-white/80"
+            >
+              <Icon className="size-4 text-[#ff5a6e]" />
+              {label}
+            </div>
+          ))}
+        </motion.div>
+      </div>
+    </div>
+  );
+}
+
+src/components/page-container.tsx
+16
+import type { ReactNode } from "react";
+import { cn } from "@/lib/utils.ts";
+
+export default function PageContainer({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn("mx-auto w-full max-w-7xl px-4 py-6 md:px-8 md:py-8", className)}>
+      {children}
+    </div>
+  );
+}
+
+src/components/page-header.tsx
+34
+import type { ReactNode } from "react";
+
+type PageHeaderProps = {
+  eyebrow?: string;
+  title: string;
+  description?: string;
+  actions?: ReactNode;
+};
+
+export default function PageHeader({
+  eyebrow,
+  title,
+  description,
+  actions,
+}: PageHeaderProps) {
+  return (
+    <div className="flex flex-col gap-4 pb-6 sm:flex-row sm:items-end sm:justify-between">
+      <div className="min-w-0">
+        {eyebrow && (
+          <p className="pb-1 text-xs font-semibold tracking-[0.18em] text-[#c8102e] uppercase dark:text-[#ff6b7d]">
+            {eyebrow}
+          </p>
+        )}
+        <h1 className="font-serif text-3xl font-semibold tracking-tight text-balance">
+          {title}
+        </h1>
+        {description && (
+          <p className="pt-1 text-sm text-muted-foreground">{description}</p>
+        )}
+      </div>
+      {actions && <div className="flex shrink-0 gap-2">{actions}</div>}
+    </div>
+  );
+}
+
+src/components/stat-card.tsx
+42
+import type { LucideIcon } from "lucide-react";
+import { Card } from "@/components/ui/card.tsx";
+import { cn } from "@/lib/utils.ts";
+
+type StatCardProps = {
+  label: string;
+  value: string;
+  icon: LucideIcon;
+  hint?: string;
+  tone?: "navy" | "red" | "neutral";
+};
+
+const TONES = {
+  navy: "bg-primary/10 text-primary",
+  red: "bg-[#c8102e]/10 text-[#c8102e] dark:text-[#ff6b7d]",
+  neutral: "bg-muted text-muted-foreground",
+} as const;
+
+export default function StatCard({
+  label,
+  value,
+  icon: Icon,
+  hint,
+  tone = "navy",
+}: StatCardProps) {
+  return (
+    <Card className="gap-3 p-5">
+      <div className="flex items-center justify-between gap-2">
+        <p className="truncate text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+          {label}
+        </p>
+        <span className={cn("rounded-md p-1.5", TONES[tone])}>
+          <Icon className="size-4" />
+        </span>
+      </div>
+      <p className="truncate font-mono text-xl font-semibold tracking-tight md:text-2xl">
+        {value}
+      </p>
+      {hint && <p className="truncate text-xs text-muted-foreground">{hint}</p>}
+    </Card>
+  );
+}
+
+src/components/ui/button.tsx
+3
+    variants: {
+      variant: {
+        default: "bg-primary text-primary-foreground hover:bg-primary/90",
+        // Brand red call-to-action
+        action:
+          "bg-[#c8102e] text-white shadow-sm hover:bg-[#a90d27] dark:bg-[#e02a42] dark:hover:bg-[#c8102e]",
+        destructive:
+          "bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:bg-destructive/60 dark:focus-visible:ring-destructive/40",
+        outline:
+
+src/hooks/use-current-user.ts
+15
+import { useConvexAuth, useQuery } from "convex/react";
+import { api } from "@/convex/_generated/api.js";
+
+export function useCurrentUser() {
+  const { isAuthenticated } = useConvexAuth();
+  const user = useQuery(
+    api.users.getCurrentUser,
+    isAuthenticated ? {} : "skip",
+  );
+  return {
+    user,
+    isLoading: user === undefined,
+    isSuperAdmin: user?.role === "super_admin",
+  };
+}
+
+src/index.css
+67
+66
+
+@theme inline {
+  --font-sans:
+    "Geist", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
+    "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+    "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-mono:
+    "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  --font-serif:
+    "Noto Serif", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-serif: "Fraunces", ui-serif, Georgia, Cambria, "Times New Roman", serif;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/* Light: white cards on a cool light-grey canvas, navy brand, red actions */
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --radius: 0.5rem;
+  --background: oklch(0.972 0.005 255);
+  --foreground: oklch(0.21 0.05 262);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.21 0.05 262);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+  --popover-foreground: oklch(0.21 0.05 262);
+  --primary: oklch(0.33 0.11 263);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.945 0.012 258);
+  --secondary-foreground: oklch(0.28 0.08 263);
+  --muted: oklch(0.955 0.007 258);
+  --muted-foreground: oklch(0.5 0.03 260);
+  --accent: oklch(0.94 0.018 258);
+  --accent-foreground: oklch(0.28 0.08 263);
+  --destructive: oklch(0.56 0.215 25);
+  --border: oklch(0.91 0.01 258);
+  --input: oklch(0.89 0.012 258);
+  --ring: oklch(0.45 0.12 263);
+  --chart-1: oklch(0.36 0.12 263);
+  --chart-2: oklch(0.58 0.21 25);
+  --chart-3: oklch(0.6 0.12 235);
+  --chart-4: oklch(0.72 0.14 75);
+  --chart-5: oklch(0.6 0.13 160);
+  --sidebar: oklch(0.2 0.065 264);
+  --sidebar-foreground: oklch(0.9 0.015 258);
+  --sidebar-primary: oklch(0.58 0.21 25);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.27 0.075 264);
+  --sidebar-accent-foreground: oklch(0.99 0 0);
+  --sidebar-border: oklch(0.3 0.06 264);
+  --sidebar-ring: oklch(0.58 0.21 25);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+  --background: oklch(0.16 0.035 264);
+  --foreground: oklch(0.95 0.01 258);
+  --card: oklch(0.205 0.04 264);
+  --card-foreground: oklch(0.95 0.01 258);
+  --popover: oklch(0.22 0.042 264);
+  --popover-foreground: oklch(0.95 0.01 258);
+  --primary: oklch(0.72 0.12 258);
+  --primary-foreground: oklch(0.17 0.04 264);
+  --secondary: oklch(0.26 0.045 264);
+  --secondary-foreground: oklch(0.93 0.01 258);
+  --muted: oklch(0.25 0.04 264);
+  --muted-foreground: oklch(0.7 0.03 258);
+  --accent: oklch(0.28 0.05 264);
+  --accent-foreground: oklch(0.95 0.01 258);
+  --destructive: oklch(0.66 0.2 23);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 14%);
+  --ring: oklch(0.65 0.12 258);
+  --chart-1: oklch(0.7 0.13 258);
+  --chart-2: oklch(0.66 0.2 23);
+  --chart-3: oklch(0.72 0.11 220);
+  --chart-4: oklch(0.8 0.14 80);
+  --chart-5: oklch(0.72 0.14 160);
+  --sidebar: oklch(0.13 0.035 264);
+  --sidebar-foreground: oklch(0.88 0.015 258);
+  --sidebar-primary: oklch(0.62 0.21 24);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.22 0.05 264);
+  --sidebar-accent-foreground: oklch(0.99 0 0);
+  --sidebar-border: oklch(1 0 0 / 8%);
+  --sidebar-ring: oklch(0.62 0.21 24);
+}
+
+@layer base {
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "tnum" 1;
+  }
+
+  button:not(:disabled),
+
+src/lib/format.test.ts
+22
+import { describe, expect, it } from "vitest";
+import { formatCalendarDay, formatMoney, toMinorUnits } from "./format.ts";
+
+describe("money formatting", () => {
+  it("converts typed amounts to minor units without float drift", () => {
+    expect(toMinorUnits(0.1 + 0.2)).toBe(30);
+    expect(toMinorUnits(1250000)).toBe(125000000);
+  });
+
+  it("shows shillings as whole numbers and dollars with cents", () => {
+    // Intl separates the currency code with a non-breaking space
+    expect(formatMoney(125000000, "TZS")).toBe("TZS\u00a01,250,000");
+    expect(formatMoney(1050, "USD")).toBe("USD\u00a010.50");
+  });
+});
+
+describe("date formatting", () => {
+  it("uses DD/MM/YYYY", () => {
+    expect(formatCalendarDay("2026-03-07")).toBe("07/03/2026");
+    expect(formatCalendarDay(undefined)).toBe("—");
+  });
+});
+
+src/lib/format.ts
+43
+import { format, parseISO } from "date-fns";
+import { DEFAULT_CURRENCY } from "@/convex/lib/constants.ts";
+
+/** Amounts are stored as integer minor units (amount x 100). */
+export function toMinorUnits(major: number): number {
+  return Math.round(major * 100);
+}
+
+export function toMajorUnits(minor: number): number {
+  return minor / 100;
+}
+
+export function formatMoney(
+  minor: number,
+  currency: string = DEFAULT_CURRENCY,
+  options: { compact?: boolean } = {},
+): string {
+  const major = toMajorUnits(minor);
+  // Shillings are rarely written with cents, so whole numbers read cleaner.
+  const wholeCurrency = ["TZS", "KES", "UGX", "RWF"].includes(currency);
+  return new Intl.NumberFormat("en-GB", {
+    style: "currency",
+    currency,
+    currencyDisplay: "code",
+    notation: options.compact ? "compact" : "standard",
+    maximumFractionDigits: options.compact ? 1 : wholeCurrency ? 0 : 2,
+    minimumFractionDigits: options.compact || wholeCurrency ? 0 : 2,
+  }).format(major);
+}
+
+/** East African style: DD/MM/YYYY */
+export function formatCalendarDay(day: string | undefined): string {
+  if (!day) return "—";
+  return format(parseISO(day), "dd/MM/yyyy");
+}
+
+export function formatTimestamp(ms: number): string {
+  return format(new Date(ms), "dd/MM/yyyy");
+}
+
+export function todayCalendarDay(): string {
+  return format(new Date(), "yyyy-MM-dd");
+}
+
+src/lib/forms.ts
+25
+import { ConvexError } from "convex/values";
+import { z } from "zod";
+
+/** A money amount typed by the user, kept as a string until submit. */
+export const amountField = z
+  .string()
+  .trim()
+  .min(1, "Enter an amount")
+  .refine((v) => /^\d+(\.\d{1,2})?$/.test(v.replace(/,/g, "")), {
+    message: "Enter a valid amount, for example 250000",
+  })
+  .transform((v) => v.replace(/,/g, ""));
+
+export function getErrorMessage(error: unknown, fallback: string): string {
+  if (
+    error instanceof ConvexError &&
+    typeof error.data === "object" &&
+    error.data !== null &&
+    "message" in error.data &&
+    typeof error.data.message === "string"
+  ) {
+    return error.data.message;
+  }
+  return fallback;
+}
+
+src/pages/businesses/_components/business-form-dialog.tsx
+318
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useMutation } from "convex/react";
+import { toast } from "sonner";
+import { api } from "@/convex/_generated/api.js";
+import type { Doc } from "@/convex/_generated/dataModel.d.ts";
+import {
+  BUSINESS_CATEGORIES,
+  CURRENCIES,
+  DEFAULT_CURRENCY,
+} from "@/convex/lib/constants.ts";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog.tsx";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form.tsx";
+import { Input } from "@/components/ui/input.tsx";
+import { Textarea } from "@/components/ui/textarea.tsx";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select.tsx";
+import { Button } from "@/components/ui/button.tsx";
+import { Spinner } from "@/components/ui/spinner.tsx";
+import { toMajorUnits, toMinorUnits } from "@/lib/format.ts";
+import { amountField, getErrorMessage } from "@/lib/forms.ts";
+
+const schema = z.object({
+  name: z.string().trim().min(1, "Business name is required").max(120),
+  category: z.string().min(1, "Choose a category"),
+  location: z.string().trim().min(1, "Location is required").max(160),
+  registrationNumber: z.string().max(80),
+  taxId: z.string().max(80),
+  registrationDate: z.string(),
+  description: z.string().max(2000),
+  currency: z.string().min(1),
+  startingCapital: amountField,
+  currentCapital: amountField,
+});
+
+type FormValues = z.infer<typeof schema>;
+
+function defaults(business?: Doc<"businesses">): FormValues {
+  return {
+    name: business?.name ?? "",
+    category: business?.category ?? "",
+    location: business?.location ?? "",
+    registrationNumber: business?.registrationNumber ?? "",
+    taxId: business?.taxId ?? "",
+    registrationDate: business?.registrationDate ?? "",
+    description: business?.description ?? "",
+    currency: business?.currency ?? DEFAULT_CURRENCY,
+    startingCapital: business
+      ? String(toMajorUnits(business.startingCapital))
+      : "",
+    currentCapital: business ? String(toMajorUnits(business.currentCapital)) : "",
+  };
+}
+
+type Props = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  business?: Doc<"businesses">;
+  onSaved?: (id: string) => void;
+};
+
+export default function BusinessFormDialog(props: Props) {
+  return (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+        {/* Remount the form each time it opens so it starts from fresh values */}
+        {props.open && <BusinessForm {...props} />}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function BusinessForm({ onOpenChange, business, onSaved }: Props) {
+  const [saving, setSaving] = useState(false);
+  const create = useMutation(api.businesses.create);
+  const update = useMutation(api.businesses.update);
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: defaults(business),
+  });
+
+  const onSubmit = async (values: FormValues) => {
+    setSaving(true);
+    const payload = {
+      ...values,
+      registrationNumber: values.registrationNumber || undefined,
+      taxId: values.taxId || undefined,
+      registrationDate: values.registrationDate || undefined,
+      description: values.description || undefined,
+      startingCapital: toMinorUnits(Number(values.startingCapital)),
+      currentCapital: toMinorUnits(Number(values.currentCapital)),
+    };
+    try {
+      if (business) {
+        await update({ id: business._id, ...payload });
+        toast.success("Business updated");
+        onSaved?.(business._id);
+      } else {
+        const id = await create(payload);
+        toast.success("Business registered");
+        onSaved?.(id);
+      }
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not save the business"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>{business ? "Edit business" : "Register a business"}</DialogTitle>
+        <DialogDescription>
+          Amounts are entered in the business currency.
+        </DialogDescription>
+      </DialogHeader>
+      <Form {...form}>
+        <form
+          onSubmit={form.handleSubmit(onSubmit)}
+          className="grid gap-4 sm:grid-cols-2"
+        >
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem className="sm:col-span-2">
+                <FormLabel>Business name</FormLabel>
+                <FormControl>
+                  <Input placeholder="Marcus Hardware Ltd" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="category"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Category</FormLabel>
+                <Select value={field.value} onValueChange={field.onChange}>
+                  <FormControl>
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Choose a category" />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    {BUSINESS_CATEGORIES.map((c) => (
+                      <SelectItem key={c} value={c}>
+                        {c}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="location"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Location</FormLabel>
+                <FormControl>
+                  <Input placeholder="Kariakoo, Dar es Salaam" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="registrationNumber"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Registration number</FormLabel>
+                <FormControl>
+                  <Input placeholder="BRELA 123456" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="taxId"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>TIN</FormLabel>
+                <FormControl>
+                  <Input placeholder="123-456-789" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="registrationDate"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Registration date</FormLabel>
+                <FormControl>
+                  <Input type="date" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="currency"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Currency</FormLabel>
+                <Select value={field.value} onValueChange={field.onChange}>
+                  <FormControl>
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    {CURRENCIES.map((c) => (
+                      <SelectItem key={c.code} value={c.code}>
+                        {c.code} · {c.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="startingCapital"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Starting capital</FormLabel>
+                <FormControl>
+                  <Input inputMode="decimal" placeholder="5000000" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="currentCapital"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Current capital</FormLabel>
+                <FormControl>
+                  <Input inputMode="decimal" placeholder="7500000" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="description"
+            render={({ field }) => (
+              <FormItem className="sm:col-span-2">
+                <FormLabel>Description</FormLabel>
+                <FormControl>
+                  <Textarea
+                    rows={3}
+                    placeholder="What the business does, key products and customers"
+                    {...field}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <DialogFooter className="sm:col-span-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" variant="action" disabled={saving}>
+              {saving && <Spinner />}
+              {business ? "Save changes" : "Register business"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </Form>
+    </>
+  );
+}
+
+src/pages/businesses/[id]/_components/employee-form-dialog.tsx
+227
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useMutation } from "convex/react";
+import { toast } from "sonner";
+import { api } from "@/convex/_generated/api.js";
+import type { Doc, Id } from "@/convex/_generated/dataModel.d.ts";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog.tsx";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form.tsx";
+import { Input } from "@/components/ui/input.tsx";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select.tsx";
+import { Button } from "@/components/ui/button.tsx";
+import { Spinner } from "@/components/ui/spinner.tsx";
+import { toMajorUnits, toMinorUnits } from "@/lib/format.ts";
+import { amountField, getErrorMessage } from "@/lib/forms.ts";
+
+const schema = z.object({
+  name: z.string().trim().min(1, "Name is required").max(120),
+  position: z.string().trim().min(1, "Position is required").max(80),
+  phone: z.string().max(40),
+  email: z.union([z.literal(""), z.email("Enter a valid email")]),
+  monthlySalary: amountField,
+  startDate: z.string(),
+  status: z.enum(["active", "inactive"]),
+});
+
+type FormValues = z.infer<typeof schema>;
+
+type Props = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  businessId: Id<"businesses">;
+  employee?: Doc<"employees">;
+};
+
+export default function EmployeeFormDialog(props: Props) {
+  return (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        {props.open && <EmployeeForm {...props} />}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function EmployeeForm({ onOpenChange, businessId, employee }: Props) {
+  const [saving, setSaving] = useState(false);
+  const create = useMutation(api.employees.create);
+  const update = useMutation(api.employees.update);
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: {
+      name: employee?.name ?? "",
+      position: employee?.position ?? "",
+      phone: employee?.phone ?? "",
+      email: employee?.email ?? "",
+      monthlySalary: employee ? String(toMajorUnits(employee.monthlySalary)) : "",
+      startDate: employee?.startDate ?? "",
+      status: employee?.status ?? "active",
+    },
+  });
+
+  const onSubmit = async (values: FormValues) => {
+    setSaving(true);
+    const payload = {
+      ...values,
+      phone: values.phone || undefined,
+      email: values.email || undefined,
+      startDate: values.startDate || undefined,
+      monthlySalary: toMinorUnits(Number(values.monthlySalary)),
+    };
+    try {
+      if (employee) {
+        await update({ id: employee._id, ...payload });
+        toast.success("Employee updated");
+      } else {
+        await create({ businessId, ...payload });
+        toast.success("Employee added");
+      }
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not save employee"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>{employee ? "Edit employee" : "Add employee"}</DialogTitle>
+      </DialogHeader>
+      <Form {...form}>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="grid gap-4 sm:grid-cols-2">
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem className="sm:col-span-2">
+                <FormLabel>Full name</FormLabel>
+                <FormControl>
+                  <Input placeholder="Amina Juma" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="position"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Position</FormLabel>
+                <FormControl>
+                  <Input placeholder="Shop Supervisor" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="monthlySalary"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Monthly salary</FormLabel>
+                <FormControl>
+                  <Input inputMode="decimal" placeholder="600000" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="phone"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Phone</FormLabel>
+                <FormControl>
+                  <Input placeholder="+255 712 345 678" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="email"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Email</FormLabel>
+                <FormControl>
+                  <Input placeholder="amina@example.com" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="startDate"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Start date</FormLabel>
+                <FormControl>
+                  <Input type="date" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="status"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Status</FormLabel>
+                <Select value={field.value} onValueChange={field.onChange}>
+                  <FormControl>
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    <SelectItem value="active">Active</SelectItem>
+                    <SelectItem value="inactive">Inactive</SelectItem>
+                  </SelectContent>
+                </Select>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <DialogFooter className="sm:col-span-2">
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" variant="action" disabled={saving}>
+              {saving && <Spinner />}
+              {employee ? "Save changes" : "Add employee"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </Form>
+    </>
+  );
+}
+
+src/pages/businesses/[id]/_components/employees-tab.tsx
+210
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { Pencil, Plus, Trash2, Users } from "lucide-react";
+import { toast } from "sonner";
+import { api } from "@/convex/_generated/api.js";
+import type { Doc, Id } from "@/convex/_generated/dataModel.d.ts";
+import { Button } from "@/components/ui/button.tsx";
+import { Badge } from "@/components/ui/badge.tsx";
+import { Card } from "@/components/ui/card.tsx";
+import { Skeleton } from "@/components/ui/skeleton.tsx";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table.tsx";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog.tsx";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty.tsx";
+import { formatCalendarDay, formatMoney } from "@/lib/format.ts";
+import { getErrorMessage } from "@/lib/forms.ts";
+import EmployeeFormDialog from "./employee-form-dialog.tsx";
+
+type Props = {
+  businessId: Id<"businesses">;
+  currency: string;
+  canManage: boolean;
+};
+
+export default function EmployeesTab({ businessId, currency, canManage }: Props) {
+  const employees = useQuery(api.employees.listByBusiness, { businessId });
+  const remove = useMutation(api.employees.remove);
+  const [editing, setEditing] = useState<Doc<"employees"> | undefined>();
+  const [formOpen, setFormOpen] = useState(false);
+  const [deleting, setDeleting] = useState<Doc<"employees"> | undefined>();
+
+  const openForm = (employee?: Doc<"employees">) => {
+    setEditing(employee);
+    setFormOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleting) return;
+    try {
+      await remove({ id: deleting._id });
+      toast.success("Employee removed");
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not remove employee"));
+    } finally {
+      setDeleting(undefined);
+    }
+  };
+
+  if (employees === undefined) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-12 w-full" />
+        ))}
+      </div>
+    );
+  }
+
+  const activePayroll = employees
+    .filter((e) => e.status === "active")
+    .reduce((sum, e) => sum + e.monthlySalary, 0);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">
+          {employees.length} employee{employees.length === 1 ? "" : "s"} ·
+          Monthly payroll{" "}
+          <span className="font-mono font-semibold text-foreground">
+            {formatMoney(activePayroll, currency)}
+          </span>
+        </p>
+        {canManage && (
+          <Button variant="action" size="sm" onClick={() => openForm()}>
+            <Plus /> Add employee
+          </Button>
+        )}
+      </div>
+
+      {employees.length === 0 ? (
+        <Empty className="border bg-card">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <Users />
+            </EmptyMedia>
+            <EmptyTitle>No employees yet</EmptyTitle>
+            <EmptyDescription>
+              Add the people who work for this business.
+            </EmptyDescription>
+          </EmptyHeader>
+          {canManage && (
+            <EmptyContent>
+              <Button size="sm" variant="action" onClick={() => openForm()}>
+                <Plus /> Add employee
+              </Button>
+            </EmptyContent>
+          )}
+        </Empty>
+      ) : (
+        <Card className="py-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Position</TableHead>
+                <TableHead className="hidden md:table-cell">Contact</TableHead>
+                <TableHead className="hidden sm:table-cell">Started</TableHead>
+                <TableHead className="text-right">Monthly salary</TableHead>
+                <TableHead>Status</TableHead>
+                {canManage && <TableHead className="w-20" />}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {employees.map((e) => (
+                <TableRow key={e._id}>
+                  <TableCell className="font-medium">{e.name}</TableCell>
+                  <TableCell>{e.position}</TableCell>
+                  <TableCell className="hidden text-muted-foreground md:table-cell">
+                    {e.phone ?? e.email ?? "—"}
+                  </TableCell>
+                  <TableCell className="hidden sm:table-cell">
+                    {formatCalendarDay(e.startDate)}
+                  </TableCell>
+                  <TableCell className="text-right font-mono">
+                    {formatMoney(e.monthlySalary, currency)}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={e.status === "active" ? "default" : "secondary"}>
+                      {e.status === "active" ? "Active" : "Inactive"}
+                    </Badge>
+                  </TableCell>
+                  {canManage && (
+                    <TableCell>
+                      <div className="flex justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label="Edit employee"
+                          onClick={() => openForm(e)}
+                        >
+                          <Pencil />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label="Remove employee"
+                          onClick={() => setDeleting(e)}
+                        >
+                          <Trash2 />
+                        </Button>
+                      </div>
+                    </TableCell>
+                  )}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+
+      <EmployeeFormDialog
+        open={formOpen}
+        onOpenChange={setFormOpen}
+        businessId={businessId}
+        employee={editing}
+      />
+
+      <AlertDialog
+        open={deleting !== undefined}
+        onOpenChange={(o) => !o && setDeleting(undefined)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove {deleting?.name}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This deletes the employee record. To keep their history, mark
+              them as inactive instead.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDelete}>Remove</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+src/pages/businesses/[id]/page.tsx
+238
+import { useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import { useMutation, useQuery } from "convex/react";
+import {
+  Archive,
+  ArchiveRestore,
+  ArrowLeft,
+  Banknote,
+  Building2,
+  Clock,
+  Landmark,
+  MapPin,
+  Pencil,
+  TrendingUp,
+  type LucideIcon,
+} from "lucide-react";
+import { toast } from "sonner";
+import { api } from "@/convex/_generated/api.js";
+import PageContainer from "@/components/page-container.tsx";
+import StatCard from "@/components/stat-card.tsx";
+import { Button } from "@/components/ui/button.tsx";
+import { Badge } from "@/components/ui/badge.tsx";
+import { Card } from "@/components/ui/card.tsx";
+import { Skeleton } from "@/components/ui/skeleton.tsx";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs.tsx";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty.tsx";
+import { formatCalendarDay, formatMoney, formatTimestamp } from "@/lib/format.ts";
+import { getErrorMessage } from "@/lib/forms.ts";
+import BusinessFormDialog from "../_components/business-form-dialog.tsx";
+import EmployeesTab from "./_components/employees-tab.tsx";
+
+const UPCOMING_TABS: { value: string; label: string; icon: LucideIcon; text: string }[] = [
+  { value: "income", label: "Income & Expenses", icon: Banknote, text: "Income and expense records for this business arrive in the next milestone." },
+  { value: "assets", label: "Assets & Liabilities", icon: Landmark, text: "Business assets and liabilities arrive in a future milestone." },
+  { value: "reports", label: "Profit & Loss", icon: TrendingUp, text: "Profit and loss reports arrive in a future milestone." },
+];
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-4 border-b py-2.5 text-sm last:border-0">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="min-w-0 truncate text-right font-medium">{value}</span>
+    </div>
+  );
+}
+
+export default function BusinessDetailPage() {
+  const { id = "" } = useParams();
+  const business = useQuery(api.businesses.get, { id });
+  const setStatus = useMutation(api.businesses.setStatus);
+  const [editOpen, setEditOpen] = useState(false);
+
+  if (business === undefined) {
+    return (
+      <PageContainer className="space-y-4">
+        <Skeleton className="h-10 w-72" />
+        <div className="grid gap-4 sm:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-28" />
+          ))}
+        </div>
+        <Skeleton className="h-64" />
+      </PageContainer>
+    );
+  }
+
+  if (business === null) {
+    return (
+      <PageContainer>
+        <Empty className="border bg-card">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <Building2 />
+            </EmptyMedia>
+            <EmptyTitle>Business not found</EmptyTitle>
+            <EmptyDescription>
+              It may have been removed, or you may not have access to it.
+            </EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent>
+            <Button asChild size="sm">
+              <Link to="/businesses">Back to businesses</Link>
+            </Button>
+          </EmptyContent>
+        </Empty>
+      </PageContainer>
+    );
+  }
+
+  const growth = business.currentCapital - business.startingCapital;
+  const growthPct =
+    business.startingCapital > 0
+      ? ((growth / business.startingCapital) * 100).toFixed(1)
+      : null;
+  const archived = business.status === "archived";
+
+  const toggleArchive = async () => {
+    try {
+      await setStatus({ id: business._id, status: archived ? "active" : "archived" });
+      toast.success(archived ? "Business restored" : "Business archived");
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not update the business"));
+    }
+  };
+
+  return (
+    <PageContainer>
+      <Link
+        to="/businesses"
+        className="inline-flex cursor-pointer items-center gap-1 pb-4 text-sm text-muted-foreground hover:text-foreground"
+      >
+        <ArrowLeft className="size-4" /> All businesses
+      </Link>
+
+      <div className="flex flex-col gap-4 pb-6 sm:flex-row sm:items-end sm:justify-between">
+        <div className="flex min-w-0 items-center gap-4">
+          <div className="flex size-14 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+            <Building2 className="size-7" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="truncate font-serif text-3xl font-semibold tracking-tight">
+                {business.name}
+              </h1>
+              {archived && <Badge variant="secondary">Archived</Badge>}
+            </div>
+            <p className="flex items-center gap-1 text-sm text-muted-foreground">
+              <MapPin className="size-3.5" /> {business.location} · {business.category}
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          {business.canArchive && (
+            <Button variant="ghost" onClick={toggleArchive}>
+              {archived ? <ArchiveRestore /> : <Archive />}
+              {archived ? "Restore" : "Archive"}
+            </Button>
+          )}
+          {business.canManage && (
+            <Button variant="action" onClick={() => setEditOpen(true)}>
+              <Pencil /> Edit
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="grid gap-4 pb-6 sm:grid-cols-3">
+        <StatCard
+          label="Starting capital"
+          value={formatMoney(business.startingCapital, business.currency)}
+          icon={Banknote}
+          tone="neutral"
+        />
+        <StatCard
+          label="Current capital"
+          value={formatMoney(business.currentCapital, business.currency)}
+          icon={Landmark}
+        />
+        <StatCard
+          label="Capital growth"
+          value={`${growth >= 0 ? "+" : "−"}${formatMoney(Math.abs(growth), business.currency)}`}
+          hint={growthPct ? `${growthPct}% since start` : undefined}
+          icon={TrendingUp}
+          tone={growth < 0 ? "red" : "navy"}
+        />
+      </div>
+
+      <Tabs defaultValue="overview">
+        <div className="overflow-x-auto pb-2">
+          <TabsList>
+            <TabsTrigger value="overview" className="cursor-pointer">Overview</TabsTrigger>
+            <TabsTrigger value="employees" className="cursor-pointer">Employees</TabsTrigger>
+            {UPCOMING_TABS.map((t) => (
+              <TabsTrigger key={t.value} value={t.value} className="cursor-pointer">
+                {t.label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </div>
+
+        <TabsContent value="overview" className="grid gap-4 pt-2 lg:grid-cols-3">
+          <Card className="p-5 lg:col-span-2">
+            <h2 className="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+              About
+            </h2>
+            <p className="text-sm leading-relaxed whitespace-pre-line">
+              {business.description ?? "No description added yet."}
+            </p>
+          </Card>
+          <Card className="gap-0 p-5">
+            <h2 className="pb-2 text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+              Registration
+            </h2>
+            <DetailRow label="Registration no." value={business.registrationNumber ?? "—"} />
+            <DetailRow label="TIN" value={business.taxId ?? "—"} />
+            <DetailRow label="Registered" value={formatCalendarDay(business.registrationDate)} />
+            <DetailRow label="Currency" value={business.currency} />
+            <DetailRow label="Added" value={formatTimestamp(business._creationTime)} />
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="employees" className="pt-2">
+          <EmployeesTab
+            businessId={business._id}
+            currency={business.currency}
+            canManage={business.canManage}
+          />
+        </TabsContent>
+
+        {UPCOMING_TABS.map((t) => (
+          <TabsContent key={t.value} value={t.value} className="pt-2">
+            <Empty className="border bg-card">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <t.icon />
+                </EmptyMedia>
+                <EmptyTitle>Coming soon</EmptyTitle>
+                <EmptyDescription>{t.text}</EmptyDescription>
+              </EmptyHeader>
+              <EmptyContent>
+                <Clock className="size-4 text-muted-foreground" />
+              </EmptyContent>
+            </Empty>
+          </TabsContent>
+        ))}
+      </Tabs>
+
+      <BusinessFormDialog open={editOpen} onOpenChange={setEditOpen} business={business} />
+    </PageContainer>
+  );
+}
+
+src/pages/businesses/page.tsx
+157
+import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useQuery } from "convex/react";
+import { Building2, MapPin, Plus } from "lucide-react";
+import { api } from "@/convex/_generated/api.js";
+import type { Doc } from "@/convex/_generated/dataModel.d.ts";
+import PageContainer from "@/components/page-container.tsx";
+import PageHeader from "@/components/page-header.tsx";
+import { Button } from "@/components/ui/button.tsx";
+import { Card } from "@/components/ui/card.tsx";
+import { Badge } from "@/components/ui/badge.tsx";
+import { Skeleton } from "@/components/ui/skeleton.tsx";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs.tsx";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty.tsx";
+import { useCurrentUser } from "@/hooks/use-current-user.ts";
+import { formatMoney } from "@/lib/format.ts";
+import BusinessFormDialog from "./_components/business-form-dialog.tsx";
+
+type Status = Doc<"businesses">["status"];
+
+function BusinessCard({ business }: { business: Doc<"businesses"> }) {
+  const growth = business.currentCapital - business.startingCapital;
+  return (
+    <Link to={`/businesses/${business._id}`} className="cursor-pointer">
+      <Card className="h-full gap-4 p-5 transition-all hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-md">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex size-10 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
+            <Building2 className="size-5" />
+          </div>
+          <Badge variant="secondary" className="truncate">
+            {business.category}
+          </Badge>
+        </div>
+        <div className="min-w-0">
+          <h3 className="truncate text-lg font-semibold">{business.name}</h3>
+          <p className="flex items-center gap-1 truncate text-sm text-muted-foreground">
+            <MapPin className="size-3.5 shrink-0" />
+            {business.location}
+          </p>
+        </div>
+        <div className="mt-auto grid grid-cols-2 gap-3 border-t pt-4">
+          <div className="min-w-0">
+            <p className="text-[11px] tracking-wide text-muted-foreground uppercase">
+              Current capital
+            </p>
+            <p className="truncate font-mono text-sm font-semibold">
+              {formatMoney(business.currentCapital, business.currency)}
+            </p>
+          </div>
+          <div className="min-w-0">
+            <p className="text-[11px] tracking-wide text-muted-foreground uppercase">
+              Capital growth
+            </p>
+            <p
+              className={
+                growth < 0
+                  ? "truncate font-mono text-sm font-semibold text-destructive"
+                  : "truncate font-mono text-sm font-semibold text-emerald-700 dark:text-emerald-400"
+              }
+            >
+              {growth >= 0 ? "+" : "−"}
+              {formatMoney(Math.abs(growth), business.currency)}
+            </p>
+          </div>
+        </div>
+      </Card>
+    </Link>
+  );
+}
+
+export default function BusinessesPage() {
+  const [status, setStatus] = useState<Status>("active");
+  const [open, setOpen] = useState(false);
+  const navigate = useNavigate();
+  const { isSuperAdmin } = useCurrentUser();
+  const businesses = useQuery(api.businesses.list, { status });
+
+  return (
+    <PageContainer>
+      <PageHeader
+        eyebrow="Portfolio"
+        title="Businesses"
+        description="Every company in the group, with its own records and performance."
+        actions={
+          isSuperAdmin && (
+            <Button variant="action" onClick={() => setOpen(true)}>
+              <Plus /> Register business
+            </Button>
+          )
+        }
+      />
+
+      <Tabs
+        value={status}
+        onValueChange={(v) => setStatus(v === "archived" ? "archived" : "active")}
+        className="pb-6"
+      >
+        <TabsList>
+          <TabsTrigger value="active" className="cursor-pointer">Active</TabsTrigger>
+          <TabsTrigger value="archived" className="cursor-pointer">Archived</TabsTrigger>
+        </TabsList>
+      </Tabs>
+
+      {businesses === undefined ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-52 w-full" />
+          ))}
+        </div>
+      ) : businesses.length === 0 ? (
+        <Empty className="border bg-card">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <Building2 />
+            </EmptyMedia>
+            <EmptyTitle>
+              {status === "active" ? "No businesses yet" : "No archived businesses"}
+            </EmptyTitle>
+            <EmptyDescription>
+              {status === "active"
+                ? isSuperAdmin
+                  ? "Register your first business to start tracking its finances."
+                  : "You have not been given access to any business yet."
+                : "Archived businesses appear here."}
+            </EmptyDescription>
+          </EmptyHeader>
+          {status === "active" && isSuperAdmin && (
+            <EmptyContent>
+              <Button variant="action" size="sm" onClick={() => setOpen(true)}>
+                <Plus /> Register business
+              </Button>
+            </EmptyContent>
+          )}
+        </Empty>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {businesses.map((b) => (
+            <BusinessCard key={b._id} business={b} />
+          ))}
+        </div>
+      )}
+
+      <BusinessFormDialog
+        open={open}
+        onOpenChange={setOpen}
+        onSaved={(id) => navigate(`/businesses/${id}`)}
+      />
+    </PageContainer>
+  );
+}
+
+src/pages/Index.tsx
+130
+7
+import { Link } from "react-router-dom";
+import { useQuery } from "convex/react";
+import { ArrowRight, Building2, Landmark, Plus, TrendingUp } from "lucide-react";
+import { api } from "@/convex/_generated/api.js";
+import type { Doc } from "@/convex/_generated/dataModel.d.ts";
+import PageContainer from "@/components/page-container.tsx";
+import PageHeader from "@/components/page-header.tsx";
+import StatCard from "@/components/stat-card.tsx";
+import { Button } from "@/components/ui/button.tsx";
+import { Card } from "@/components/ui/card.tsx";
+import { Skeleton } from "@/components/ui/skeleton.tsx";
+import { useCurrentUser } from "@/hooks/use-current-user.ts";
+import { formatMoney } from "@/lib/format.ts";
+import { DEFAULT_CURRENCY } from "@/convex/lib/constants.ts";
+
+type Totals = { currency: string; starting: number; current: number };
+
+/** Capital can't be summed across currencies, so total each one separately. */
+function totalsByCurrency(businesses: Doc<"businesses">[]): Totals[] {
+  const map = new Map<string, Totals>();
+  for (const b of businesses) {
+    const t = map.get(b.currency) ?? { currency: b.currency, starting: 0, current: 0 };
+    t.starting += b.startingCapital;
+    t.current += b.currentCapital;
+    map.set(b.currency, t);
+  }
+  return [...map.values()].sort((a, b) =>
+    a.currency === DEFAULT_CURRENCY ? -1 : b.currency === DEFAULT_CURRENCY ? 1 : 0,
+  );
+}
+
+export default function Index() {
+  const { user } = useCurrentUser();
+  const businesses = useQuery(api.businesses.list, {});
+  const firstName = user?.name?.split(" ")[0];
+
+  if (businesses === undefined) {
+    return (
+      <PageContainer className="space-y-4">
+        <Skeleton className="h-12 w-80" />
+        <div className="grid gap-4 sm:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-28" />
+          ))}
+        </div>
+      </PageContainer>
+    );
+  }
+
+  const totals = totalsByCurrency(businesses);
+  const main = totals[0] ?? { currency: DEFAULT_CURRENCY, starting: 0, current: 0 };
+  const others = totals.slice(1);
+  const growth = main.current - main.starting;
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="text-center space-y-6">
+        <h1 className="text-4xl text-balance font-bold tracking-tight">
+          Welcome to Your Blank App
+        </h1>
+        <p className="text-xl text-muted-foreground max-w-2xl mx-auto">
+          Start chatting to build your app
+    <PageContainer>
+      <PageHeader
+        eyebrow="Group overview"
+        title={firstName ? `Karibu, ${firstName}` : "Karibu"}
+        description="A snapshot of the group. Full financial analytics arrive as each module is added."
+      />
+
+      <div className="grid gap-4 pb-6 sm:grid-cols-3">
+        <StatCard
+          label="Active businesses"
+          value={String(businesses.length)}
+          icon={Building2}
+          tone="neutral"
+        />
+        <StatCard
+          label="Total current capital"
+          value={formatMoney(main.current, main.currency)}
+          hint={
+            others.length
+              ? `Plus ${others.map((o) => formatMoney(o.current, o.currency, { compact: true })).join(", ")}`
+              : undefined
+          }
+          icon={Landmark}
+        />
+        <StatCard
+          label="Capital growth"
+          value={`${growth >= 0 ? "+" : "−"}${formatMoney(Math.abs(growth), main.currency)}`}
+          hint={`Since starting capital, ${main.currency}`}
+          icon={TrendingUp}
+          tone={growth < 0 ? "red" : "navy"}
+        />
+      </div>
+
+      <Card className="gap-0 py-0">
+        <div className="flex items-center justify-between border-b px-5 py-4">
+          <h2 className="font-semibold">Businesses</h2>
+          <Button asChild variant="ghost" size="sm">
+            <Link to="/businesses">
+              View all <ArrowRight />
+            </Link>
+          </Button>
+        </div>
+        {businesses.length === 0 ? (
+          <div className="flex flex-col items-center gap-3 px-5 py-12 text-center">
+            <p className="text-sm text-muted-foreground">
+              No businesses registered yet.
+            </p>
+            <Button asChild variant="action" size="sm">
+              <Link to="/businesses">
+                <Plus /> Register your first business
+              </Link>
+            </Button>
+          </div>
+        ) : (
+          <ul>
+            {businesses.slice(0, 6).map((b) => (
+              <li key={b._id} className="border-b last:border-0">
+                <Link
+                  to={`/businesses/${b._id}`}
+                  className="flex cursor-pointer items-center gap-4 px-5 py-3 hover:bg-muted/60"
+                >
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+                    <Building2 className="size-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-medium">{b.name}</p>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {b.category} · {b.location}
+                    </p>
+                  </div>
+                  <p className="shrink-0 font-mono text-sm font-semibold">
+                    {formatMoney(b.currentCapital, b.currency, { compact: true })}
+                  </p>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+    </PageContainer>
+  );
+}
